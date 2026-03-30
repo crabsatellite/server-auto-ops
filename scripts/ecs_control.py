@@ -119,6 +119,35 @@ if ($idle) { Write-Host "IDLE" } else { Write-Host "ACTIVE" }
     return 'IDLE' in output
 
 
+def backup():
+    """Run backup script on VPS before shutdown."""
+    status = get_status()
+    if status != 'Running':
+        print(f'not running, skip backup')
+        return
+    print('Running backup...')
+    output = run_command(r'''
+$env:PATH += ";C:\git\cmd"
+$env:GIT_TERMINAL_PROMPT = "0"
+
+function Backup-Repo($path, $name) {
+    if (-not (Test-Path "$path\.git")) { Write-Host "$name : no repo"; return }
+    Set-Location $path
+    $status = C:\git\cmd\git.exe status --porcelain 2>&1
+    if (-not $status) { Write-Host "$name : clean"; return }
+    $date = Get-Date -Format "yyyy/MM/dd HH:mm"
+    C:\git\cmd\git.exe add -A 2>&1
+    C:\git\cmd\git.exe commit -m "auto backup: $date" 2>&1
+    C:\git\cmd\git.exe push origin HEAD 2>&1
+    Write-Host "$name : backed up"
+}
+
+Backup-Repo "D:\MC" "Minecraft"
+''', timeout=120)
+    if output:
+        print(output.strip())
+
+
 if __name__ == '__main__':
     cmd = sys.argv[1] if len(sys.argv) > 1 else 'status'
     if cmd == 'start':
@@ -129,7 +158,10 @@ if __name__ == '__main__':
         print(get_status())
     elif cmd == 'check-idle':
         if check_idle():
-            print('Idle threshold reached, stopping...')
+            print('Idle threshold reached, backing up then stopping...')
+            backup()
             stop()
         else:
             print('Server active or not running, no action.')
+    elif cmd == 'backup':
+        backup()

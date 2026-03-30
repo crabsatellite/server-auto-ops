@@ -1,0 +1,20 @@
+name: Scheduled Backup
+on:
+  schedule:
+    - cron: "0 4 * * *"  # UTC 04:00 = CST 12:00 noon
+  workflow_dispatch:
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install alibabacloud_ecs20140526
+      - name: Run backup
+        env:
+          ALIBABA_ACCESS_KEY_ID: ${{ secrets.ALIBABA_ACCESS_KEY_ID }}
+          ALIBABA_ACCESS_KEY_SECRET: ${{ secrets.ALIBABA_ACCESS_KEY_SECRET }}
+        run: python scripts/ecs_control.py backup
