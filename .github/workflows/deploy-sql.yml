@@ -1,0 +1,30 @@
+name: Deploy SQL Scripts
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action: deploy, test, or deploy-and-test'
+        required: true
+        default: 'deploy-and-test'
+        type: choice
+        options:
+          - deploy
+          - test
+          - deploy-and-test
+
+jobs:
+  deploy-sql:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install alibabacloud_ecs20140526
+
+      - name: Deploy and test SQL
+        env:
+          ALIBABA_ACCESS_KEY_ID: ${{ secrets.ALIBABA_ACCESS_KEY_ID }}
+          ALIBABA_ACCESS_KEY_SECRET: ${{ secrets.ALIBABA_ACCESS_KEY_SECRET }}
+        run: |
+          python scripts/deploy_sql.py ${{ github.event.inputs.action }}
