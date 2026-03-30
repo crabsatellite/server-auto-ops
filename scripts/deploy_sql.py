@@ -6,42 +6,70 @@ GIT = r'C:\git\cmd\git.exe'
 REPO_PATH = r'C:\SDGO'
 
 
-def find_sqlcmd():
-    """Find sqlcmd on VPS."""
-    output = run_command(r'''
-$paths = @(
-    "C:\SDGO\LiteSQL\SQLCMD.EXE",
-    "C:\SDGO\LiteSQL\Tools\Binn\SQLCMD.EXE",
-    "C:\Program Files\Microsoft SQL Server\Client SDK\ODBC\170\Tools\Binn\SQLCMD.EXE",
-    "C:\Program Files\Microsoft SQL Server\110\Tools\Binn\SQLCMD.EXE"
-)
-foreach ($p in $paths) { if (Test-Path $p) { Write-Host $p; return } }
-# Search
-$found = Get-ChildItem C:\SDGO -Recurse -Filter "SQLCMD.EXE" -ErrorAction SilentlyContinue | Select-Object -First 1
-if ($found) { Write-Host $found.FullName } else { Write-Host "NOT_FOUND" }
-''', timeout=30)
-    path = output.strip() if output else None
-    if path and path != 'NOT_FOUND':
-        return path
-    return None
-
-
 def run_sql(db, sql_file=None, query=None, timeout=60):
-    """Run SQL on VPS. Returns output."""
-    sqlcmd_path = getattr(run_sql, '_path', None)
-    if not sqlcmd_path:
-        print('Finding sqlcmd...')
-        sqlcmd_path = find_sqlcmd()
-        if not sqlcmd_path:
-            print('ERROR: sqlcmd not found on VPS')
-            sys.exit(1)
-        print(f'Found: {sqlcmd_path}')
-        run_sql._path = sqlcmd_path
-
+    """Run SQL on VPS via PowerShell .NET SqlClient."""
     if sql_file:
-        cmd = f'& "{sqlcmd_path}" -S localhost -U sa -P 123456 -d {db} -i "{sql_file}" 2>&1'
+        # Read file and execute
+        cmd = rf'''
+$sql = Get-Content "{sql_file}" -Raw -Encoding UTF8
+# Split on GO statements for batch execution
+$batches = $sql -split '(?m)^\s*GO\s*$'
+$conn = New-Object System.Data.SqlClient.SqlConnection "Server=localhost;Database={db};User Id=sa;Password=123456;"
+$conn.Open()
+foreach ($batch in $batches) {{
+    $batch = $batch.Trim()
+    if ($batch -eq "") {{ continue }}
+    try {{
+        $cmd = $conn.CreateCommand()
+        $cmd.CommandText = $batch
+        $cmd.CommandTimeout = {timeout}
+        # Capture messages
+        $handler = [System.Data.SqlClient.SqlInfoMessageEventHandler]{{ param($s,$e) Write-Host $e.Message }}
+        $conn.add_InfoMessage($handler)
+        $reader = $cmd.ExecuteReader()
+        while ($reader.HasRows) {{
+            while ($reader.Read()) {{
+                $row = ""
+                for ($i=0; $i -lt $reader.FieldCount; $i++) {{
+                    if ($i -gt 0) {{ $row += "`t" }}
+                    $row += $reader.GetValue($i).ToString()
+                }}
+                Write-Host $row
+            }}
+            [void]$reader.NextResult()
+        }}
+        $reader.Close()
+        $conn.remove_InfoMessage($handler)
+    }} catch {{
+        Write-Host "SQL ERROR: $($_.Exception.Message)"
+    }}
+}}
+$conn.Close()
+'''
     else:
-        cmd = f'& "{sqlcmd_path}" -S localhost -U sa -P 123456 -d {db} -Q "{query}" 2>&1'
+        cmd = rf'''
+$conn = New-Object System.Data.SqlClient.SqlConnection "Server=localhost;Database={db};User Id=sa;Password=123456;"
+$conn.Open()
+$handler = [System.Data.SqlClient.SqlInfoMessageEventHandler]{{ param($s,$e) Write-Host $e.Message }}
+$conn.add_InfoMessage($handler)
+$cmd = $conn.CreateCommand()
+$cmd.CommandText = "{query}"
+$cmd.CommandTimeout = {timeout}
+$reader = $cmd.ExecuteReader()
+while ($reader.HasRows) {{
+    while ($reader.Read()) {{
+        $row = ""
+        for ($i=0; $i -lt $reader.FieldCount; $i++) {{
+            if ($i -gt 0) {{ $row += "`t" }}
+            $row += $reader.GetValue($i).ToString()
+        }}
+        Write-Host $row
+    }}
+    [void]$reader.NextResult()
+}}
+$reader.Close()
+$conn.Close()
+'''
     output = run_command(cmd, timeout=timeout)
     return output.strip() if output else 'TIMEOUT'
 
