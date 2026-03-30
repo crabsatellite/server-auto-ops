@@ -18,5 +18,5 @@ if status != 'Running':
 print(f'Database: {db}')
 print(f'Query: {query}')
 print('---')
-result = run_sql(db, query=query, timeout=60)
+result = run_sql(db, query=query, timeout=120)
 print(result)
