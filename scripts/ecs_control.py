@@ -130,20 +130,34 @@ def backup():
 $env:PATH += ";C:\git\cmd"
 $env:GIT_TERMINAL_PROMPT = "0"
 
-function Backup-Repo($path, $name) {
+function Backup-Repo($path, $name, $addPaths) {
     if (-not (Test-Path "$path\.git")) { Write-Host "$name : no repo"; return }
     Set-Location $path
+    if ($addPaths) {
+        foreach ($p in $addPaths) { C:\git\cmd\git.exe add $p 2>&1 }
+    } else {
+        C:\git\cmd\git.exe add -A 2>&1
+    }
     $status = C:\git\cmd\git.exe status --porcelain 2>&1
     if (-not $status) { Write-Host "$name : clean"; return }
     $date = Get-Date -Format "yyyy/MM/dd HH:mm"
-    C:\git\cmd\git.exe add -A 2>&1
     C:\git\cmd\git.exe commit -m "auto backup: $date" 2>&1
     C:\git\cmd\git.exe push origin HEAD 2>&1
     Write-Host "$name : backed up"
 }
 
+# SDGO: export DB to JSON then commit
+if (Test-Path "C:\python312\python.exe") {
+    Write-Host "SDGO: exporting DB..."
+    C:\python312\python.exe -X utf8 "C:\SDGO\db_backup.py" export 2>&1
+    Backup-Repo "C:\SDGO" "SDGO" @("db_backup/", "db_backup.py", "daily_backup.bat")
+} else {
+    Write-Host "SDGO: python not found, skip"
+}
+
+# Minecraft: commit all changes
 Backup-Repo "D:\MC" "Minecraft"
-''', timeout=120)
+''', timeout=300)
     if output:
         print(output.strip())
 
