@@ -83,21 +83,31 @@ def check_idle():
         print(f'status:{status}, skip')
         return False
 
-    # Check WireGuard last handshake times
+    # Check WireGuard handshakes + game port connections
     output = run_command(r'''
 $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-$wgOutput = & "C:\Program Files\WireGuard\wg.exe" show sdgo latest-handshakes 2>&1
-if ($LASTEXITCODE -ne 0) { Write-Host "wg-error"; exit 0 }
 $idle = $true
-foreach ($line in $wgOutput -split "`n") {
-    $parts = $line.Trim() -split "\s+"
-    if ($parts.Count -ge 2 -and $parts[1] -match "^\d+$") {
-        $lastHandshake = [long]$parts[1]
-        $elapsed = $now - $lastHandshake
-        Write-Host "peer:$($parts[0].Substring(0,8)):${elapsed}s"
-        if ($lastHandshake -gt 0 -and $elapsed -lt IDLE_THRESHOLD) { $idle = $false }
+
+# Check WireGuard peer handshakes
+$wgOutput = & "C:\Program Files\WireGuard\wg.exe" show sdgo latest-handshakes 2>&1
+if ($LASTEXITCODE -eq 0) {
+    foreach ($line in $wgOutput -split "`n") {
+        $parts = $line.Trim() -split "\s+"
+        if ($parts.Count -ge 2 -and $parts[1] -match "^\d+$") {
+            $lastHandshake = [long]$parts[1]
+            $elapsed = $now - $lastHandshake
+            Write-Host "peer:$($parts[0].Substring(0,8)):${elapsed}s"
+            if ($lastHandshake -gt 0 -and $elapsed -lt IDLE_THRESHOLD) { $idle = $false }
+        }
     }
-}
+} else { Write-Host "wg-error" }
+
+# Check active game connections (SDGO 5001, MC 25565)
+$sdgo = (netstat -an | Select-String "5001.*ESTABLISHED").Count
+$mc = (netstat -an | Select-String "25565.*ESTABLISHED").Count
+Write-Host "connections: sdgo=$sdgo mc=$mc"
+if ($sdgo -gt 0 -or $mc -gt 0) { $idle = $false }
+
 if ($idle) { Write-Host "IDLE" } else { Write-Host "ACTIVE" }
 '''.replace('IDLE_THRESHOLD', str(IDLE_HOURS * 3600)))
 
