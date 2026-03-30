@@ -1,0 +1,30 @@
+name: Run SQL Query
+on:
+  workflow_dispatch:
+    inputs:
+      database:
+        description: 'Database name (e.g. GDCommon, GOnlineGame)'
+        required: true
+        default: 'GDCommon'
+        type: string
+      query:
+        description: 'SQL query to execute'
+        required: true
+        type: string
+
+jobs:
+  run-sql:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install alibabacloud_ecs20140526
+
+      - name: Run SQL on VPS
+        env:
+          ALIBABA_ACCESS_KEY_ID: ${{ secrets.ALIBABA_ACCESS_KEY_ID }}
+          ALIBABA_ACCESS_KEY_SECRET: ${{ secrets.ALIBABA_ACCESS_KEY_SECRET }}
+        run: |
+          python scripts/run_sql_query.py "${{ github.event.inputs.database }}" "${{ github.event.inputs.query }}"
