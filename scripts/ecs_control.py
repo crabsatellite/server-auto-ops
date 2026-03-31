@@ -6,7 +6,7 @@ from alibabacloud_tea_openapi.models import Config
 
 INSTANCE_ID = os.environ.get('ECS_INSTANCE_ID', 'i-j6cdvdlwbxy9zybehw6i')
 REGION = os.environ.get('ECS_REGION', 'cn-hongkong')
-IDLE_HOURS = int(os.environ.get('IDLE_HOURS', '24'))
+IDLE_HOURS = int(os.environ.get('IDLE_HOURS', '1'))
 
 config = Config(
     access_key_id=os.environ['ALIBABA_ACCESS_KEY_ID'],
