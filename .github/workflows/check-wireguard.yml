@@ -19,7 +19,19 @@ jobs:
           python -c "
           import scripts.ecs_control as ecs
           output = ecs.run_command(r'''
-          wg show all
+          # Find wg.exe
+          \$wg = Get-ChildItem 'C:\Program Files\WireGuard\wg.exe' -ErrorAction SilentlyContinue
+          if (\$wg) { & \$wg.FullName show all }
+          else { Write-Host 'wg.exe not found, checking services...' }
+
+          # WireGuard tunnel services
+          Get-Service WireGuardTunnel* | Format-Table Name, Status -AutoSize
+
+          # Network interfaces
+          Get-NetAdapter | Where-Object { \$_.InterfaceDescription -like '*WireGuard*' -or \$_.Name -like '*sdgo*' -or \$_.Name -like '*wg*' } | Format-Table Name, Status, LinkSpeed -AutoSize
+
+          # IP config for WireGuard interface
+          Get-NetIPAddress -InterfaceAlias 'sdgo' -ErrorAction SilentlyContinue | Format-Table IPAddress, PrefixLength -AutoSize
           ''')
           print(output if output else 'NO OUTPUT')
           "
