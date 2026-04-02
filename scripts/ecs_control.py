@@ -75,12 +75,41 @@ def run_command(cmd, timeout=30):
     return None
 
 
+def get_uptime_minutes():
+    """Get how many minutes the instance has been running since last start."""
+    from datetime import datetime, timezone
+    req = models.DescribeInstancesRequest(
+        region_id=REGION,
+        instance_ids=f'["{INSTANCE_ID}"]'
+    )
+    resp = client.describe_instances(req)
+    for inst in resp.body.instances.instance:
+        if inst.status != 'Running' or not inst.start_time:
+            return None
+        # start_time format: "2026-04-02T10:00:00Z"
+        started = datetime.fromisoformat(inst.start_time.replace('Z', '+00:00'))
+        now = datetime.now(timezone.utc)
+        return (now - started).total_seconds() / 60.0
+    return None
+
+
+GRACE_PERIOD_MINUTES = 30
+
+
 def check_idle():
     """Check if server is idle. Returns True if should shut down."""
     status = get_status()
     if status != 'Running':
         print(f'status:{status}, skip')
         return False
+
+    # Grace period: don't shut down if recently started
+    uptime = get_uptime_minutes()
+    if uptime is not None and uptime < GRACE_PERIOD_MINUTES:
+        print(f'uptime: {uptime:.0f}min < {GRACE_PERIOD_MINUTES}min grace period, skip')
+        return False
+    if uptime is not None:
+        print(f'uptime: {uptime:.0f}min')
 
     # Check active game connections (SDGO 5001, MC 25565)
     output = run_command(r'''
