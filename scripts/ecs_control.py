@@ -185,5 +185,13 @@ if __name__ == '__main__':
             stop()
         else:
             print('Server active or not running, no action.')
+    elif cmd == 'reboot':
+        status = get_status()
+        if status != 'Running':
+            print(f'not-running:{status}')
+        else:
+            req = models.RebootInstanceRequest(instance_id=INSTANCE_ID, force_stop=False)
+            client.reboot_instance(req)
+            print('rebooting')
     elif cmd == 'backup':
         backup()
