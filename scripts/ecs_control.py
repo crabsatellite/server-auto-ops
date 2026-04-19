@@ -128,53 +128,76 @@ if ($sdgo -gt 0 -or $mc -gt 0) { Write-Host "ACTIVE" } else { Write-Host "IDLE" 
 
 
 def backup():
-    """Run backup script on VPS before shutdown."""
+    """Run backup script on VPS before shutdown.
+
+    Returns True only if every repo's local commits reached the remote
+    (clean repos count as success). Never shutdown when this returns False.
+    """
     status = get_status()
     if status != 'Running':
         print(f'not running, skip backup')
-        return
+        return False
     print('Running backup...')
     output = run_command(r'''
 $env:PATH += ";C:\git\cmd"
 $env:GIT_TERMINAL_PROMPT = "0"
+$script:allOk = $true
 
 function Backup-Repo($path, $name, $addPaths) {
-    if (-not (Test-Path "$path\.git")) { Write-Host "$name : no repo"; return }
-    Set-Location $path
-    if ($addPaths) {
-        foreach ($p in $addPaths) { C:\git\cmd\git.exe add $p 2>&1 }
-    } else {
-        C:\git\cmd\git.exe add -A 2>&1
-    }
-    $status = C:\git\cmd\git.exe status --porcelain 2>&1
-    if (-not $status) { Write-Host "$name : clean"; return }
-    $date = Get-Date -Format "yyyy/MM/dd HH:mm"
-    C:\git\cmd\git.exe commit -m "auto backup: $date" 2>&1
-    # -Xtheirs: on conflict keep our local commit (VPS is authoritative for world/DB data)
-    C:\git\cmd\git.exe pull --rebase -Xtheirs origin HEAD 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        C:\git\cmd\git.exe rebase --abort 2>&1
-        Write-Host "$name : pull --rebase FAILED, push skipped"
+    if (-not (Test-Path "$path\.git")) {
+        Write-Host "SKIP:${name}:no-repo"
         return
     }
-    C:\git\cmd\git.exe push origin HEAD 2>&1
-    Write-Host "$name : backed up"
+    Set-Location $path
+    if ($addPaths) {
+        foreach ($p in $addPaths) { & C:\git\cmd\git.exe add $p 2>&1 | Out-Null }
+    } else {
+        & C:\git\cmd\git.exe add -A 2>&1 | Out-Null
+    }
+    $status = & C:\git\cmd\git.exe status --porcelain 2>&1
+    if ($status) {
+        $date = Get-Date -Format "yyyy/MM/dd HH:mm"
+        & C:\git\cmd\git.exe commit -m "auto backup: $date" 2>&1 | Out-Null
+    }
+    # -Xtheirs: on conflict keep our local commit (VPS is authoritative for world/DB data)
+    & C:\git\cmd\git.exe pull --rebase -Xtheirs origin HEAD 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        & C:\git\cmd\git.exe rebase --abort 2>&1 | Out-Null
+        Write-Host "FAIL:${name}:pull-rebase-failed"
+        $script:allOk = $false
+        return
+    }
+    $ahead = & C:\git\cmd\git.exe rev-list --count "origin/HEAD..HEAD" 2>&1
+    if (-not ($ahead -match '^\d+$') -or [int]$ahead -eq 0) {
+        Write-Host "OK:${name}:clean"
+        return
+    }
+    & C:\git\cmd\git.exe push origin HEAD 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "FAIL:${name}:push-failed"
+        $script:allOk = $false
+        return
+    }
+    Write-Host "OK:${name}:pushed-${ahead}"
 }
 
-# SDGO: export DB to JSON then commit
+# SDGO: export DB to JSON then commit (only db_backup paths, not full repo)
 if (Test-Path "C:\python312\python.exe") {
     Write-Host "SDGO: exporting DB..."
-    C:\python312\python.exe -X utf8 "C:\SDGO\db_backup.py" export 2>&1
+    C:\python312\python.exe -X utf8 "C:\SDGO\db_backup.py" export 2>&1 | Out-Null
     Backup-Repo "C:\SDGO" "SDGO" @("db_backup/", "db_backup.py", "daily_backup.bat")
 } else {
-    Write-Host "SDGO: python not found, skip"
+    Write-Host "SKIP:SDGO:no-python"
 }
 
 # Minecraft: commit all changes
 Backup-Repo "D:\MC" "Minecraft"
+
+if ($script:allOk) { Write-Host "RESULT:SUCCESS" } else { Write-Host "RESULT:FAILURE" }
 ''', timeout=300)
     if output:
         print(output.strip())
+    return output is not None and 'RESULT:SUCCESS' in output
 
 
 if __name__ == '__main__':
@@ -188,8 +211,11 @@ if __name__ == '__main__':
     elif cmd == 'check-idle':
         if check_idle():
             print('Idle threshold reached, backing up then stopping...')
-            backup()
-            stop()
+            if backup():
+                stop()
+            else:
+                print('Backup FAILED — NOT stopping instance. Manual intervention required.')
+                sys.exit(2)
         else:
             print('Server active or not running, no action.')
     elif cmd == 'reboot':
@@ -201,4 +227,5 @@ if __name__ == '__main__':
             client.reboot_instance(req)
             print('rebooting')
     elif cmd == 'backup':
-        backup()
+        if not backup():
+            sys.exit(2)
