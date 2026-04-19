@@ -150,8 +150,8 @@ function Backup-Repo($path, $name, $addPaths) {
     if (-not $status) { Write-Host "$name : clean"; return }
     $date = Get-Date -Format "yyyy/MM/dd HH:mm"
     C:\git\cmd\git.exe commit -m "auto backup: $date" 2>&1
-    # Pull before push to avoid rejected pushes
-    C:\git\cmd\git.exe pull --rebase origin HEAD 2>&1
+    # -Xtheirs: on conflict keep our local commit (VPS is authoritative for world/DB data)
+    C:\git\cmd\git.exe pull --rebase -Xtheirs origin HEAD 2>&1
     if ($LASTEXITCODE -ne 0) {
         C:\git\cmd\git.exe rebase --abort 2>&1
         Write-Host "$name : pull --rebase FAILED, push skipped"
