@@ -131,7 +131,8 @@ def backup():
     """Run backup script on VPS before shutdown.
 
     Returns True only if every repo's local commits reached the remote
-    (clean repos count as success). Never shutdown when this returns False.
+    (clean repos count as success). On False, caller should still stop
+    the VPS — local commits remain on disk for next boot to re-sync.
     """
     status = get_status()
     if status != 'Running':
@@ -142,18 +143,31 @@ def backup():
 $env:PATH += ";C:\git\cmd"
 $env:GIT_TERMINAL_PROMPT = "0"
 $script:allOk = $true
+$MaxStagedMB = 100
 
-function Backup-Repo($path, $name, $addPaths) {
+function Backup-Repo($path, $name) {
     if (-not (Test-Path "$path\.git")) {
         Write-Host "SKIP:${name}:no-repo"
         return
     }
     Set-Location $path
-    if ($addPaths) {
-        foreach ($p in $addPaths) { & C:\git\cmd\git.exe add $p 2>&1 | Out-Null }
-    } else {
-        & C:\git\cmd\git.exe add -A 2>&1 | Out-Null
+    & C:\git\cmd\git.exe add -A 2>&1 | Out-Null
+
+    # Safety: abort if staged set is unexpectedly huge (missing .gitignore rule)
+    $staged = & C:\git\cmd\git.exe diff --cached --name-only 2>&1
+    $stagedBytes = 0
+    foreach ($f in $staged) {
+        $fp = Join-Path $path $f
+        if (Test-Path $fp -PathType Leaf) { $stagedBytes += (Get-Item $fp).Length }
     }
+    $stagedMB = [math]::Round($stagedBytes / 1MB, 1)
+    if ($stagedMB -gt $MaxStagedMB) {
+        & C:\git\cmd\git.exe reset 2>&1 | Out-Null
+        Write-Host "FAIL:${name}:staged-too-large:${stagedMB}MB"
+        $script:allOk = $false
+        return
+    }
+
     $status = & C:\git\cmd\git.exe status --porcelain 2>&1
     if ($status) {
         $date = Get-Date -Format "yyyy/MM/dd HH:mm"
@@ -181,11 +195,11 @@ function Backup-Repo($path, $name, $addPaths) {
     Write-Host "OK:${name}:pushed-${ahead}"
 }
 
-# SDGO: export DB to JSON then commit (only db_backup paths, not full repo)
+# SDGO: export DB to JSON first, then commit all tracked+new (gitignore filters)
 if (Test-Path "C:\python312\python.exe") {
     Write-Host "SDGO: exporting DB..."
     C:\python312\python.exe -X utf8 "C:\SDGO\db_backup.py" export 2>&1 | Out-Null
-    Backup-Repo "C:\SDGO" "SDGO" @("db_backup/", "db_backup.py", "daily_backup.bat")
+    Backup-Repo "C:\SDGO" "SDGO"
 } else {
     Write-Host "SKIP:SDGO:no-python"
 }
@@ -211,11 +225,9 @@ if __name__ == '__main__':
     elif cmd == 'check-idle':
         if check_idle():
             print('Idle threshold reached, backing up then stopping...')
-            if backup():
-                stop()
-            else:
-                print('Backup FAILED — NOT stopping instance. Manual intervention required.')
-                sys.exit(2)
+            if not backup():
+                print('Backup FAILED — stopping anyway (idle VPS wastes money, commits stay on disk).')
+            stop()
         else:
             print('Server active or not running, no action.')
     elif cmd == 'reboot':
