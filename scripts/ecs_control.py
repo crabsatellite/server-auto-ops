@@ -143,7 +143,7 @@ def backup():
 $env:PATH += ";C:\git\cmd"
 $env:GIT_TERMINAL_PROMPT = "0"
 $script:allOk = $true
-$MaxStagedMB = 100
+$MaxFileMB = 100  # GitHub's hard per-file limit (without LFS)
 
 function Backup-Repo($path, $name) {
     if (-not (Test-Path "$path\.git")) {
@@ -153,17 +153,23 @@ function Backup-Repo($path, $name) {
     Set-Location $path
     & C:\git\cmd\git.exe add -A 2>&1 | Out-Null
 
-    # Safety: abort if staged set is unexpectedly huge (missing .gitignore rule)
+    # Safety: abort if any single staged file exceeds GitHub's 100MB hard limit.
+    # (Total staged size is irrelevant; GitHub accepts multi-GB pushes of small files.)
     $staged = & C:\git\cmd\git.exe diff --cached --name-only 2>&1
-    $stagedBytes = 0
+    $tooBig = $null
     foreach ($f in $staged) {
         $fp = Join-Path $path $f
-        if (Test-Path $fp -PathType Leaf) { $stagedBytes += (Get-Item $fp).Length }
+        if (Test-Path $fp -PathType Leaf) {
+            $sz = (Get-Item $fp).Length
+            if ($sz -gt $MaxFileMB * 1MB) {
+                $tooBig = "${f}:$([math]::Round($sz/1MB,1))MB"
+                break
+            }
+        }
     }
-    $stagedMB = [math]::Round($stagedBytes / 1MB, 1)
-    if ($stagedMB -gt $MaxStagedMB) {
+    if ($tooBig) {
         & C:\git\cmd\git.exe reset 2>&1 | Out-Null
-        Write-Host "FAIL:${name}:staged-too-large:${stagedMB}MB"
+        Write-Host "FAIL:${name}:file-too-large:${tooBig}"
         $script:allOk = $false
         return
     }
