@@ -1,0 +1,27 @@
+name: Idle Shutdown
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check-idle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install alibabacloud_ecs20140526
+      - name: Backup and stop idle ECS
+        env:
+          ALIBABA_ACCESS_KEY_ID: ${{ secrets.ALIBABA_ACCESS_KEY_ID }}
+          ALIBABA_ACCESS_KEY_SECRET: ${{ secrets.ALIBABA_ACCESS_KEY_SECRET }}
+          ECS_REGION: cn-hongkong
+          ECS_INSTANCE_ID: i-j6cdvdlwbxy9zybehw6i
+        run: python scripts/ecs_control.py check-idle
