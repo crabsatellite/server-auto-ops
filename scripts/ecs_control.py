@@ -93,9 +93,6 @@ def get_uptime_minutes():
     return None
 
 
-GRACE_PERIOD_MINUTES = 30
-
-
 def check_idle():
     """Check if server is idle. Returns True if should shut down."""
     status = get_status()
@@ -103,11 +100,7 @@ def check_idle():
         print(f'status:{status}, skip')
         return False
 
-    # Grace period: don't shut down if recently started
     uptime = get_uptime_minutes()
-    if uptime is not None and uptime < GRACE_PERIOD_MINUTES:
-        print(f'uptime: {uptime:.0f}min < {GRACE_PERIOD_MINUTES}min grace period, skip')
-        return False
     if uptime is not None:
         print(f'uptime: {uptime:.0f}min')
 
