@@ -9,8 +9,6 @@ on:
         description: "CodeUp repository ID to sync"
         required: false
         type: string
-  schedule:
-    - cron: "*/30 * * * *"
 
 jobs:
   sync-codeup:
