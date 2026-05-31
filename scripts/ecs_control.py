@@ -53,7 +53,7 @@ def stop():
     print('stopped')
 
 
-def run_command(cmd, timeout=30):
+def run_command_result(cmd, timeout=30):
     req = models.RunCommandRequest(
         region_id=REGION,
         instance_id=[INSTANCE_ID],
@@ -71,8 +71,21 @@ def run_command(cmd, timeout=30):
         dresp = client.describe_invocation_results(dreq)
         results = dresp.body.invocation.invocation_results.invocation_result
         if results and results[0].invocation_status not in ('Running', 'Pending'):
-            return base64.b64decode(results[0].output).decode('utf-8', errors='replace') if results[0].output else ''
+            result = results[0]
+            output = base64.b64decode(result.output).decode('utf-8', errors='replace') if result.output else ''
+            return {
+                'status': result.invocation_status,
+                'exit_code': result.exit_code,
+                'error_code': result.error_code,
+                'error_info': result.error_info,
+                'output': output,
+            }
     return None
+
+
+def run_command(cmd, timeout=30):
+    result = run_command_result(cmd, timeout=timeout)
+    return result['output'] if result else None
 
 
 def get_uptime_minutes():

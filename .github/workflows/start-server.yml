@@ -4,9 +4,13 @@ on:
     types: [start-server]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   start:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

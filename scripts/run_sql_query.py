@@ -15,8 +15,12 @@ if status != 'Running':
     print(f'VPS is {status}, cannot run query')
     sys.exit(1)
 
-print(f'Database: {db}')
-print(f'Query: {query}')
-print('---')
-result = run_sql(db, query=query, timeout=120)
-print(result)
+try:
+    print(f'Database: {db}')
+    print(f'Query: {query}')
+    print('---')
+    result = run_sql(db, query=query, timeout=120)
+    print(result)
+except Exception as exc:
+    print(f'ERROR: {exc}', file=sys.stderr)
+    sys.exit(1)

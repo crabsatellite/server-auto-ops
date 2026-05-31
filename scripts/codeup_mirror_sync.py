@@ -32,11 +32,16 @@ def repository_ids_from_args():
     if len(sys.argv) > 1:
         return sys.argv[1:]
 
+    repository_id = os.environ.get("CODEUP_REPOSITORY_ID")
+    if repository_id:
+        return [repository_id]
+
     ids = os.environ.get("CODEUP_REPOSITORY_IDS")
     if ids:
         return [part.strip() for part in ids.split(",") if part.strip()]
 
-    return [getenv_required("CODEUP_REPOSITORY_ID")]
+    print("missing required environment variable: CODEUP_REPOSITORY_ID or CODEUP_REPOSITORY_IDS", file=sys.stderr)
+    sys.exit(2)
 
 
 def create_client():

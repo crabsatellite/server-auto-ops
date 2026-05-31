@@ -10,9 +10,17 @@ on:
         required: false
         type: string
 
+permissions:
+  contents: read
+
+concurrency:
+  group: codeup-sync-${{ github.event.client_payload.repository_id || github.event.inputs.repository_id || 'default' }}
+  cancel-in-progress: false
+
 jobs:
   sync-codeup:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

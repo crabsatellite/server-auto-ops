@@ -1,77 +1,103 @@
 """Deploy SQL scripts to VPS and run tests via ECS RunCommand."""
-import sys, time
-from ecs_control import run_command, get_status
+import base64
+import re
+import sys
+from ecs_control import run_command_result, get_status
 
 GIT = r'C:\git\cmd\git.exe'
 REPO_PATH = r'C:\SDGO'
 
 
+def _b64(value):
+    return base64.b64encode(value.encode('utf-8')).decode('ascii')
+
+
+def _validate_db(db):
+    if not re.fullmatch(r'[A-Za-z0-9_]+', db):
+        raise ValueError(f'invalid database name: {db!r}')
+
+
+def _sql_runner_script(db, timeout, sql_file=None, query=None):
+    _validate_db(db)
+    conn_str = f"Server=localhost;Database={db};User Id=sa;Password=123456;"
+    if sql_file:
+        source = f'$sql = Get-Content -LiteralPath $sourcePath -Raw -Encoding UTF8'
+        source_vars = f"$sourcePath = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{_b64(sql_file)}'))"
+    elif query is not None:
+        source = '$sql = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($queryB64))'
+        source_vars = f"$queryB64 = '{_b64(query)}'"
+    else:
+        raise ValueError('sql_file or query is required')
+
+    return rf'''
+$ErrorActionPreference = "Stop"
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+{source_vars}
+$connStr = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{_b64(conn_str)}'))
+
+function Write-ReaderRows($reader) {{
+    while ($reader.HasRows) {{
+        while ($reader.Read()) {{
+            $row = ""
+            for ($i=0; $i -lt $reader.FieldCount; $i++) {{
+                if ($i -gt 0) {{ $row += "`t" }}
+                $row += $reader.GetValue($i).ToString()
+            }}
+            Write-Output $row
+        }}
+        [void]$reader.NextResult()
+    }}
+}}
+
+try {{
+    {source}
+    $batches = $sql -split '(?m)^\s*GO\s*$'
+    $conn = New-Object System.Data.SqlClient.SqlConnection $connStr
+    $handler = [System.Data.SqlClient.SqlInfoMessageEventHandler]{{ param($s,$e) Write-Output $e.Message }}
+    $conn.add_InfoMessage($handler)
+    $conn.Open()
+    try {{
+        foreach ($batch in $batches) {{
+            $batch = $batch.Trim()
+            if ($batch -eq "") {{ continue }}
+            $cmd = $conn.CreateCommand()
+            $cmd.CommandText = $batch
+            $cmd.CommandTimeout = {timeout}
+            $reader = $cmd.ExecuteReader()
+            try {{
+                Write-ReaderRows $reader
+            }} finally {{
+                $reader.Close()
+            }}
+        }}
+    }} finally {{
+        $conn.remove_InfoMessage($handler)
+        $conn.Close()
+    }}
+}} catch {{
+    Write-Output "SQL ERROR: $($_.Exception.Message)"
+    exit 1
+}}
+'''
+
+
+def _run_remote_or_fail(cmd, timeout=60, label='remote command'):
+    result = run_command_result(cmd, timeout=timeout)
+    if result is None:
+        raise RuntimeError(f'{label} timed out waiting for ECS RunCommand result')
+    output = (result['output'] or '').strip()
+    exit_code = result.get('exit_code')
+    exit_ok = exit_code in (0, None, '') or str(exit_code) == '0'
+    if result['status'] != 'Success' or not exit_ok:
+        details = output or result.get('error_info') or result.get('error_code') or 'no output'
+        raise RuntimeError(f'{label} failed: {details}')
+    return output
+
+
 def run_sql(db, sql_file=None, query=None, timeout=60):
     """Run SQL on VPS via PowerShell .NET SqlClient."""
-    if sql_file:
-        # Read file and execute
-        cmd = rf'''
-$sql = Get-Content "{sql_file}" -Raw -Encoding UTF8
-# Split on GO statements for batch execution
-$batches = $sql -split '(?m)^\s*GO\s*$'
-$conn = New-Object System.Data.SqlClient.SqlConnection "Server=localhost;Database={db};User Id=sa;Password=123456;"
-$conn.Open()
-foreach ($batch in $batches) {{
-    $batch = $batch.Trim()
-    if ($batch -eq "") {{ continue }}
-    try {{
-        $cmd = $conn.CreateCommand()
-        $cmd.CommandText = $batch
-        $cmd.CommandTimeout = {timeout}
-        # Capture messages
-        $handler = [System.Data.SqlClient.SqlInfoMessageEventHandler]{{ param($s,$e) Write-Host $e.Message }}
-        $conn.add_InfoMessage($handler)
-        $reader = $cmd.ExecuteReader()
-        while ($reader.HasRows) {{
-            while ($reader.Read()) {{
-                $row = ""
-                for ($i=0; $i -lt $reader.FieldCount; $i++) {{
-                    if ($i -gt 0) {{ $row += "`t" }}
-                    $row += $reader.GetValue($i).ToString()
-                }}
-                Write-Host $row
-            }}
-            [void]$reader.NextResult()
-        }}
-        $reader.Close()
-        $conn.remove_InfoMessage($handler)
-    }} catch {{
-        Write-Host "SQL ERROR: $($_.Exception.Message)"
-    }}
-}}
-$conn.Close()
-'''
-    else:
-        cmd = rf'''
-$conn = New-Object System.Data.SqlClient.SqlConnection "Server=localhost;Database={db};User Id=sa;Password=123456;"
-$conn.Open()
-$handler = [System.Data.SqlClient.SqlInfoMessageEventHandler]{{ param($s,$e) Write-Host $e.Message }}
-$conn.add_InfoMessage($handler)
-$cmd = $conn.CreateCommand()
-$cmd.CommandText = "{query}"
-$cmd.CommandTimeout = {timeout}
-$reader = $cmd.ExecuteReader()
-while ($reader.HasRows) {{
-    while ($reader.Read()) {{
-        $row = ""
-        for ($i=0; $i -lt $reader.FieldCount; $i++) {{
-            if ($i -gt 0) {{ $row += "`t" }}
-            $row += $reader.GetValue($i).ToString()
-        }}
-        Write-Host $row
-    }}
-    [void]$reader.NextResult()
-}}
-$reader.Close()
-$conn.Close()
-'''
-    output = run_command(cmd, timeout=timeout)
-    return output.strip() if output else 'TIMEOUT'
+    cmd = _sql_runner_script(db, timeout, sql_file=sql_file, query=query)
+    return _run_remote_or_fail(cmd, timeout=timeout, label=f'SQL on {db}')
 
 
 def deploy():
@@ -79,7 +105,7 @@ def deploy():
     print('=== DEPLOY ===')
 
     # Handle git conflicts: stash untracked then pull
-    output = run_command(rf'''
+    output = _run_remote_or_fail(rf'''
 $env:GIT_TERMINAL_PROMPT = "0"
 Set-Location {REPO_PATH}
 # Move conflicting files if they exist
@@ -94,7 +120,7 @@ foreach ($f in @("start_all.ps1", "update_db.sql")) {{
     }}
 }}
 ''', timeout=60)
-    print('Git pull:', output.strip() if output else 'TIMEOUT')
+    print('Git pull:', output if output else 'OK')
 
     # Install sp_Daily_SortAndDedup
     print('\nInstalling sp_Daily_SortAndDedup...')
@@ -141,4 +167,8 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except Exception as exc:
+        print(f'ERROR: {exc}', file=sys.stderr)
+        sys.exit(1)
