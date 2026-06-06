@@ -28,9 +28,10 @@ $env:CODEUP_REMOTE_TOKEN = "<github-pat>"
 python scripts\codeup_mirror_sync.py
 ```
 
-GitHub Actions runs every 30 minutes and can also be triggered manually from
-the `Sync CodeUp Mirror` workflow. The Minecraft server repo can also trigger it
-by sending a `repository_dispatch` event named `sync-codeup`.
+The `Sync CodeUp Mirror` workflow can also be triggered manually with either a
+CodeUp repository ID or a CodeUp repository URL/path. A repository dispatch event
+named `sync-codeup` can pass `client_payload.repository_id` or
+`client_payload.repository_path`.
 
 Current Chifanla values:
 
@@ -39,3 +40,5 @@ Current Chifanla values:
 - Minecraft server CodeUp repository ID: `6917787`
 - Minecraft server CodeUp URL:
   `https://codeup.aliyun.com/65bb261da854e4c241ac5426/crabsatellite/minecraft_chifanla_server_1.21.1`
+- Minecraft client CodeUp URL:
+  `https://codeup.aliyun.com/65bb261da854e4c241ac5426/crabsatellite/minecraft_chifanla_client_1.21.1`
