@@ -1,0 +1,20 @@
+name: Start Minecraft (local host)
+run-name: Minecraft local wake request
+on:
+  repository_dispatch:
+    types: [start-minecraft]
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: minecraft-wake-signal
+  cancel-in-progress: false
+jobs:
+  signal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Publish wake signal
+        run: |
+          echo "Minecraft wake request accepted."
+          echo "A successful workflow is a signal only, not a server health check."
+          echo "The authorized local listener will consume this run once within its TTL."
