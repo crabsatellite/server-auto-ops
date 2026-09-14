@@ -50,4 +50,17 @@ class ProtocolTests(unittest.TestCase):
         import os
         self.assertTrue(m.pid_alive(os.getpid()));self.assertFalse(m.pid_alive(None))
 
+class IdleTests(unittest.TestCase):
+    def test_empty_threshold(self):
+        t=m.IdleTimer(30)
+        self.assertFalse(t.observe(0,100)); self.assertFalse(t.observe(0,129)); self.assertTrue(t.observe(0,130))
+    def test_failure_resets_empty_period(self):
+        t=m.IdleTimer(30)
+        t.observe(0,100); self.assertFalse(t.observe(None,129))
+        self.assertFalse(t.observe(0,500)); self.assertTrue(t.observe(0,530))
+    def test_player_resets_empty_period(self):
+        t=m.IdleTimer(30)
+        t.observe(0,100); self.assertFalse(t.observe(1,129))
+        self.assertFalse(t.observe(0,150)); self.assertTrue(t.observe(0,180))
+
 if __name__=="__main__":unittest.main()

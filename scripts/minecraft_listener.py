@@ -212,6 +212,17 @@ def backup_ignored(c,request_id):
             if hashlib.sha256(z.read(row["path"])).hexdigest()!=row["sha256"]: raise RuntimeError("Ignored-file backup verification failed")
     return str(target)
 
+class IdleTimer:
+    """Only a continuously observed empty period qualifies for automatic stop."""
+    def __init__(self, seconds):
+        self.seconds=seconds; self.empty_since=None
+    def observe(self, players, now):
+        if players is None or players > 0:
+            self.empty_since=None
+            return False
+        if self.empty_since is None: self.empty_since=now
+        return now-self.empty_since >= self.seconds
+
 def worker(c,request_id):
     paths=runtime_paths(c)
     with lock(paths["worker_lock"]):
@@ -219,9 +230,9 @@ def worker(c,request_id):
         if port_busy(c["port"]) or pid_alive(previous.get("java_pid")):
             raise RuntimeError("Existing Minecraft process; refusing duplicate start")
         state={"request_id":request_id,"worker_pid":os.getpid(),"java_pid":None,"phase":"preflight",
-               "started_utc":utcnow().isoformat(),"players":None}
+               "started_utc":utcnow().isoformat(),"players":None,"idle_seconds":c.get("idle_seconds",1800)}
         atomic(paths["runtime"],state)
-        proc=None; stop_sent=False
+        proc=None; stop_sent=False; stopped_requested_at=None; last_guard=0
         try:
             sync(c,"pre")
             root=Path(c["server_root"])
@@ -233,22 +244,29 @@ def worker(c,request_id):
                 with paths["server_log"].open("a",encoding="utf-8") as f:
                     for line in proc.stdout: f.write(line); f.flush()
             thread=threading.Thread(target=pump,daemon=True); thread.start()
-            last_player=time.monotonic(); ready_at=None
+            idle_timer=IdleTimer(c.get("idle_seconds",1800))
             while proc.poll() is None:
                 control=read_json(paths["control"],{})
                 requested_stop=control.get("request_id")==request_id and control.get("command")=="stop"
                 try:
                     info=status(port=c["port"]); players=info["players"]["online"]
-                    if ready_at is None: ready_at=time.monotonic(); last_player=ready_at
                     state.update(phase="stopping" if stop_sent else "ready",players=players,status_utc=utcnow().isoformat())
-                    if players: last_player=time.monotonic()
-                    idle=ready_at is not None and time.monotonic()-last_player >= c.get("idle_seconds",1800)
+                    idle=idle_timer.observe(players,time.monotonic())
                 except Exception:
                     # A failed status probe is NOT evidence of an empty server.
-                    state.update(players=None); idle=False
+                    state.update(players=None); idle=idle_timer.observe(None,time.monotonic())
                 if (requested_stop or idle) and not stop_sent:
-                    proc.stdin.write("save-all flush\nstop\n");proc.stdin.flush();stop_sent=True
-                    state["phase"]="stopping"; LOG.info("Requested graceful Minecraft-only stop")
+                    proc.stdin.write("save-all flush\nstop\n");proc.stdin.flush();stop_sent=True;stopped_requested_at=time.monotonic()
+                    state["phase"]="stopping"; state["stop_reason"]="requested" if requested_stop else "idle"
+                    LOG.info("Requested graceful Minecraft-only stop (%s)",state["stop_reason"])
+                if stop_sent and c.get("shutdown_guard") and time.monotonic()-stopped_requested_at >= 60 and time.monotonic()-last_guard >= 60:
+                    last_guard=time.monotonic()
+                    # Helper refuses any live Minecraft/server/main or unrecognized non-daemon thread.
+                    # Only releases the known PFM idle writer after normal server shutdown.
+                    guard=subprocess.run([c["java"],"--add-modules","jdk.attach","-jar",c["shutdown_guard"],str(proc.pid),"release"],
+                        capture_output=True,creationflags=HIDDEN,timeout=20)
+                    state["shutdown_guard_exit"]=guard.returncode
+                    LOG.info("Post-stop PFM guard exit=%s",guard.returncode)
                 atomic(paths["runtime"],state)
                 time.sleep(c.get("health_seconds",10))
             thread.join(timeout=10)
@@ -282,6 +300,6 @@ def main():
         atomic(paths["control"],{"request_id":state["request_id"],"command":"stop"})
         print("Graceful stop requested for Minecraft only.")
     else:
-        print(json.dumps({"listener":read_json(paths["listener"],{}),"runtime":read_json(paths["runtime"],{})},ensure_ascii=False,indent=2))
+        print(json.dumps({"settings":{"idle_seconds":c.get("idle_seconds",1800),"poll_seconds":c.get("poll_seconds",30)},"listener":read_json(paths["listener"],{}),"runtime":read_json(paths["runtime"],{})},ensure_ascii=False,indent=2))
 
 if __name__=="__main__": main()
