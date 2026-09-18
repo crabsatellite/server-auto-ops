@@ -1,24 +1,20 @@
 name: Start Server
+run-name: Minecraft local wake request (legacy start-server)
 on:
   repository_dispatch:
     types: [start-server]
   workflow_dispatch:
-
-permissions:
-  contents: read
-
+permissions: {}
+concurrency:
+  group: minecraft-wake-signal
+  cancel-in-progress: false
 jobs:
-  start:
+  signal:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 2
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-      - run: pip install alibabacloud_ecs20140526
-      - name: Start ECS
-        env:
-          ALIBABA_ACCESS_KEY_ID: ${{ secrets.ALIBABA_ACCESS_KEY_ID }}
-          ALIBABA_ACCESS_KEY_SECRET: ${{ secrets.ALIBABA_ACCESS_KEY_SECRET }}
-        run: python scripts/ecs_control.py start
+      - name: Publish local Minecraft wake signal
+        run: |
+          echo "Legacy start-server now wakes Minecraft on the local PC."
+          echo "This workflow does not start Aliyun ECS or SDGO."
+          echo "Success is a signal only; the local listener reports actual server readiness."

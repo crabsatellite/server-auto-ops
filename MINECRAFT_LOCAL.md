@@ -1,15 +1,15 @@
 # Minecraft local wake controller
 
-Minecraft-only. The legacy `start-server.yml` ECS/SDGO workflow is intentionally unchanged.
+Minecraft-only. Both `start-server` (legacy callers) and `start-minecraft` now signal the local PC. Neither start workflow starts Aliyun ECS or SDGO. Other cloud/SDGO workflows and resources are unchanged.
 
 ## Operation
 
 1. Preserve and verify the stopped canonical server checkout (including ignored files) with `scripts/backup_minecraft_local.py`. Preserve new remote Git history before a one-time reviewed fast-forward. Cloud disks are a separate source; a local backup does not certify their contents.
 2. Adapt the existing server sync script to support `-LocalAuthoritative`: never import a newer remote world automatically after cutover; never force push or merge region files.
-3. Keep a private JSON config **outside this public repository**. Fields required by `minecraft_listener.py`: repository, branch, workflow, allowed_actors, server_root, java, java_args, gh, state_prefix, backup_parent, port. Optional defaults: poll_seconds=30, request_ttl_seconds=600, health_seconds=10, idle_seconds=1800. Use absolute local paths. Credentials come from the current user's existing `gh auth login`, never from workflow payloads.
-4. Run `scripts/install_minecraft_listener.ps1 -Config <private-config> -Python <python.exe>` under that user. It installs a hidden interactive-logon scheduled task (or a current-user Run entry if task registration is denied) and starts it now; the PC must remain awake and the user logged in. It does not change power settings or start at pre-login boot.
-5. Run **Start Minecraft (local host)** in GitHub Actions, or `python scripts/minecraft_listener.py request --config <private-config>`. The repository_dispatch type is **start-minecraft**, NOT the old start-server. Existing callers must select this new event; the legacy event still targets ECS.
-6. `... status --config ...` reads local listener/runtime evidence. `... stop --config ...` requests save-all flush + stop, never OS shutdown.
+3. Keep a private JSON config **outside this public repository**. Fields required by `minecraft_listener.py`: repository, branch, workflows, allowed_actors, server_root, java, java_args, gh, state_prefix, backup_parent, port. Optional defaults: poll_seconds=30, request_ttl_seconds=600, health_seconds=10, idle_seconds=1800. Set `workflows` to `["start-minecraft.yml", "start-server.yml"]` to accept both exact workflow paths; a legacy single `workflow` configuration is still supported. Use absolute local paths. Credentials come from the current user's existing `gh auth login`, never from workflow payloads.
+4. Run `scripts/install_minecraft_listener.ps1 -Config <private-config> -Python <python.exe>` under that user. It installs a hidden supervisor: preferably a scheduled task with logon, recurring recovery and restart-on-failure; if task registration is denied, current-user Run plus a managed Startup shortcut point to the same singleton supervisor. The supervisor restarts only its polling child after exit or a 5-minute heartbeat stall, never a JVM or server worker. The PC must remain awake and the user logged in; the fallback is not a pre-login Windows service and cannot recover if every supervisor process is externally killed until logon/manual restart. It does not change power settings.
+5. Run **Start Server** (original remote entry) or **Start Minecraft (local host)** in GitHub Actions. `python scripts/minecraft_listener.py request --event start-server --config <private-config>` verifies the original event; omitting `--event` uses start-minecraft. Both workflows publish local wake signals only, without cloud credentials or SDKs. Existing remote callers using start-server need no change.
+6. `... status --config ...` reads supervisor, listener heartbeat and runtime evidence. `... stop --config ...` requests save-all flush + stop, never OS shutdown.
 
 ## Safety and lifecycle
 
@@ -26,7 +26,7 @@ Minecraft-only. The legacy `start-server.yml` ECS/SDGO workflow is intentionally
 
 `python -m unittest discover -s scripts -p test_minecraft_listener.py -v`
 
-End-to-end acceptance: activate listener, dispatch new workflow, verify local JVM ready via protocol/logs, gracefully stop, verify backup/remote SHA, repeat with another workflow run. Verify actual external client gameplay separately before claiming Internet access works.
+End-to-end acceptance: activate supervisor, dispatch the legacy start-server event, verify local JVM ready via protocol/logs, gracefully stop, verify backup/remote SHA, repeat with another workflow run. Terminate only the positively identified polling child while a JVM is running and confirm that it respawns without disrupting the worker/JVM. Verify actual external client gameplay separately before claiming Internet access works.
 
 ## Known PFM shutdown workaround (opt-in)
 

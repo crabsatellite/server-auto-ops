@@ -1,7 +1,7 @@
 """Consume trusted GitHub wake runs; own Minecraft, never the host power state.
 Only stdlib + the user's existing gh login are needed. Runtime files stay outside Git.
 """
-import argparse, contextlib, ctypes, hashlib, json, logging, os, socket, struct
+import argparse, contextlib, ctypes, hashlib, json, logging, os, re, socket, struct
 import subprocess, sys, threading, time, urllib.request, zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -101,24 +101,34 @@ def port_busy(port):
         with socket.create_connection(("127.0.0.1", port), 1): return True
     except OSError: return False
 
+def wake_workflows(c):
+    values=c.get("workflows", [c.get("workflow", "start-minecraft.yml")])
+    if not isinstance(values,list) or not values or len(values)>4:
+        raise ValueError("Expected 1-4 explicit wake workflow filenames")
+    if any(not isinstance(v,str) or not re.fullmatch(r"[A-Za-z0-9_-]+\.ya?ml",v) for v in values):
+        raise ValueError("Invalid wake workflow filename")
+    return list(dict.fromkeys(values))
+
 def eligible(run, config, activated, seen, now=None):
     now = now or utcnow()
     if str(run.get("id")) in seen: return False
     if run.get("conclusion") != "success" or run.get("status") != "completed": return False
     if run.get("event") not in ("workflow_dispatch", "repository_dispatch"): return False
     if run.get("head_branch") != config["branch"]: return False
-    if run.get("path", "").split("@")[0] != ".github/workflows/" + config["workflow"]: return False
+    if run.get("path", "").split("@")[0] not in {".github/workflows/"+w for w in wake_workflows(config)}: return False
     if run.get("repository", {}).get("full_name") != config["repository"]: return False
     if run.get("actor", {}).get("login") not in config["allowed_actors"]: return False
+    if run.get("triggering_actor",run.get("actor",{})).get("login") not in config["allowed_actors"]: return False
     try: created = datetime.fromisoformat(run["created_at"].replace("Z", "+00:00"))
     except (KeyError, ValueError, TypeError): return False
+    if created.tzinfo is None: return False
     age = (now-created).total_seconds()
     return activated <= created and 0 <= age <= config.get("request_ttl_seconds", 600)
 
 class GitHub:
     def __init__(self, gh): self.gh = gh
     def api(self, path, method="GET", data=None):
-        p = subprocess.run([self.gh, "auth", "token"], capture_output=True, creationflags=HIDDEN, timeout=20)
+        p = subprocess.run([self.gh, "auth", "token"], capture_output=True, creationflags=HIDDEN, timeout=20, stdin=subprocess.DEVNULL)
         if p.returncode: raise RuntimeError("GitHub credential unavailable; run gh auth login as this user")
         token = p.stdout.decode().strip()
         req = urllib.request.Request("https://api.github.com/" + path.lstrip("/"),
@@ -134,7 +144,8 @@ def runtime_paths(c):
     return {k:Path(str(base)+"."+suffix) for k,suffix in {
         "listener":"listener.json", "runtime":"runtime.json", "control":"control.json",
         "listener_lock":"listener.lock", "worker_lock":"worker.lock", "log":"log",
-        "server_log":"server.log"}.items()}
+        "server_log":"server.log", "supervisor":"supervisor.json",
+        "supervisor_lock":"supervisor.lock", "diagnostic_log":"supervisor-child.log"}.items()}
 
 def start_worker(c, config_file, request_id):
     paths=runtime_paths(c)
@@ -148,34 +159,98 @@ def start_worker(c, config_file, request_id):
             creationflags=HIDDEN, close_fds=True)
     return "worker_requested"
 
+def poll_wake_runs(gh,c):
+    runs={}; errors={}
+    for workflow in wake_workflows(c):
+        try:
+            response=gh.api(f"repos/{c['repository']}/actions/workflows/{workflow}/runs?status=completed&per_page=20")
+            for run in response.get("workflow_runs",[]): runs[str(run["id"])]=run
+        except Exception as exc:
+            errors[workflow]=type(exc).__name__
+    return sorted(runs.values(),key=lambda r:r.get("created_at","")),errors
+
 def listen(c, config_file):
     paths=runtime_paths(c); gh=GitHub(c["gh"])
     with lock(paths["listener_lock"]):
         state=read_json(paths["listener"],None)
         if state is None:
             state={"activated_utc":utcnow().isoformat(),"seen":[],"requests":[]}
-            atomic(paths["listener"],state)
         activated=datetime.fromisoformat(state["activated_utc"])
-        LOG.info("Listener active; no historical requests before %s",activated)
+        state.update(listener_pid=os.getpid(),listener_started_utc=utcnow().isoformat(),workflows=wake_workflows(c))
+        atomic(paths["listener"],state)
+        LOG.info("Listener active pid=%s; trusted workflows=%s",os.getpid(),wake_workflows(c))
         while True:
             try:
-                d=gh.api(f"repos/{c['repository']}/actions/workflows/{c['workflow']}/runs?status=completed&per_page=20")
-                for run in reversed(d.get("workflow_runs",[])):
+                runs,errors=poll_wake_runs(gh,c)
+                for run in runs:
                     if not eligible(run,c,activated,state["seen"]): continue
                     # Consume durably BEFORE spawning: crash means fail-closed, never replay.
                     rid=str(run["id"]); state["seen"]=(state["seen"]+[rid])[-200:]
-                    state["requests"]=(state["requests"]+[{"id":rid,"accepted_utc":utcnow().isoformat()}])[-100:]
+                    state["requests"]=(state["requests"]+[{"id":rid,"workflow":run["path"],"accepted_utc":utcnow().isoformat()}])[-100:]
                     atomic(paths["listener"],state)
                     result=start_worker(c,config_file,rid)
                     state["requests"][-1]["result"]=result; atomic(paths["listener"],state)
                     LOG.info("Request %s: %s",rid,result)
-                state["last_poll_utc"]=utcnow().isoformat(); state.pop("error",None)
+                state["last_poll_utc"]=utcnow().isoformat()
+                state["workflow_errors"]=errors
+                if not errors: state["last_success_utc"]=state["last_poll_utc"]
+                state.pop("error",None)
+                if errors: LOG.warning("Workflow poll errors: %s",errors)
                 atomic(paths["listener"],state)
             except Exception as exc:
                 # Never log response bodies or credential-bearing command lines.
                 LOG.warning("Poll failed (%s); leaving all data untouched",type(exc).__name__)
-                state["error"]=type(exc).__name__; atomic(paths["listener"],state)
+                state["error"]=type(exc).__name__; state["last_poll_utc"]=utcnow().isoformat()
+                atomic(paths["listener"],state)
             time.sleep(c.get("poll_seconds",30))
+
+def listener_stalled(state, child_pid, started_at, now, stale_seconds):
+    heartbeat=started_at
+    if state.get("listener_pid")==child_pid:
+        try:
+            parsed=datetime.fromisoformat(state["last_poll_utc"])
+            if parsed.tzinfo is not None: heartbeat=max(heartbeat,parsed.timestamp())
+        except (KeyError,ValueError,TypeError): pass
+    return now-heartbeat > stale_seconds
+
+def supervise(c,config_file):
+    """Watch only our polling child. Never terminate a worker, JVM or host."""
+    paths=runtime_paths(c)
+    with lock(paths["supervisor_lock"]):
+        previous=read_json(paths["supervisor"],{})
+        # Fail closed rather than fight an orphaned polling process from an earlier supervisor.
+        if pid_alive(previous.get("child_pid")):
+            raise RuntimeError("Prior listener is still alive; inspect before taking ownership")
+        state={"pid":os.getpid(),"started_utc":utcnow().isoformat(),"restart_count":0,"child_pid":None}
+        while True:
+            child=None; started=time.time()
+            try:
+                with paths["diagnostic_log"].open("a",encoding="utf-8") as out:
+                    child=subprocess.Popen([sys.executable,str(Path(__file__).resolve()),"listen","--config",str(config_file)],
+                        stdin=subprocess.DEVNULL,stdout=out,stderr=out,creationflags=HIDDEN,close_fds=True)
+                state.update(child_pid=child.pid,phase="running",child_started_utc=utcnow().isoformat())
+                LOG.info("Supervisor started listener pid=%s",child.pid)
+                while child.poll() is None:
+                    state["heartbeat_utc"]=utcnow().isoformat();atomic(paths["supervisor"],state)
+                    try: observed=read_json(paths["listener"],{})
+                    except (OSError,ValueError): observed={}
+                    stale=max(300,6*c.get("poll_seconds",30),60*len(wake_workflows(c))+c.get("poll_seconds",30))
+                    if listener_stalled(observed,child.pid,started,time.time(),stale):
+                        LOG.error("Polling child stalled; restarting only its owned pid=%s",child.pid)
+                        child.terminate();child.wait(timeout=15)
+                        break
+                    time.sleep(c.get("supervisor_check_seconds",5))
+                state.update(child_pid=None,last_exit_code=child.returncode,phase="restarting")
+            except Exception as exc:
+                state["last_error_type"]=type(exc).__name__
+                LOG.error("Supervisor error type=%s",type(exc).__name__)
+                # Do not spawn a competing listener if the owned one may still be alive.
+                if child is not None and child.poll() is None:
+                    atomic(paths["supervisor"],state)
+                    raise
+            state["restart_count"]+=1;atomic(paths["supervisor"],state)
+            time.sleep(c.get("supervisor_restart_seconds",5))
+
 
 def sync(c,phase,exit_code=0):
     script=Path(c["server_root"])/"scripts"/"sync_local_server.ps1"
@@ -283,16 +358,19 @@ def worker(c,request_id):
             atomic(paths["runtime"],state)
 
 def main():
-    a=argparse.ArgumentParser(); a.add_argument("mode",choices=["listen","worker","request","status","stop"])
+    a=argparse.ArgumentParser(); a.add_argument("mode",choices=["listen","supervise","worker","request","status","stop"])
     a.add_argument("--config",required=True);a.add_argument("--request-id",default="manual")
+    a.add_argument("--event",choices=["start-server","start-minecraft"],default="start-minecraft")
     args=a.parse_args();config_file=Path(args.config).resolve();c=read_json(config_file)
     paths=runtime_paths(c)
     logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(message)s",
         handlers=[logging.FileHandler(paths["log"],encoding="utf-8")])
+    wake_workflows(c)
     if args.mode=="listen": listen(c,config_file)
+    elif args.mode=="supervise": supervise(c,config_file)
     elif args.mode=="worker": worker(c,args.request_id)
     elif args.mode=="request":
-        GitHub(c["gh"]).api(f"repos/{c['repository']}/dispatches",method="POST",data={"event_type":"start-minecraft"})
+        GitHub(c["gh"]).api(f"repos/{c['repository']}/dispatches",method="POST",data={"event_type":args.event})
         print("Wake request sent. GitHub completion is not a Minecraft readiness receipt.")
     elif args.mode=="stop":
         state=read_json(paths["runtime"],{})
@@ -300,6 +378,6 @@ def main():
         atomic(paths["control"],{"request_id":state["request_id"],"command":"stop"})
         print("Graceful stop requested for Minecraft only.")
     else:
-        print(json.dumps({"settings":{"idle_seconds":c.get("idle_seconds",1800),"poll_seconds":c.get("poll_seconds",30)},"listener":read_json(paths["listener"],{}),"runtime":read_json(paths["runtime"],{})},ensure_ascii=False,indent=2))
+        print(json.dumps({"settings":{"idle_seconds":c.get("idle_seconds",1800),"poll_seconds":c.get("poll_seconds",30)},"supervisor":read_json(paths["supervisor"],{}),"listener":read_json(paths["listener"],{}),"runtime":read_json(paths["runtime"],{})},ensure_ascii=False,indent=2))
 
 if __name__=="__main__": main()
