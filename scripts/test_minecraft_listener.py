@@ -112,66 +112,98 @@ class WorkflowPollingTests(unittest.TestCase):
         self.assertIn("types: [start-server]",text)
         self.assertNotIn("ecs_control",text);self.assertNotIn("secrets.",text);self.assertNotIn("uses:",text)
 
-class RelayStreamTests(unittest.TestCase):
-    def test_upload_continues_during_blocked_download(self):
-        client,relay_client=socket.socketpair()
-        relay_upstream,server=socket.socketpair()
-        relay_client.setsockopt(socket.SOL_SOCKET,socket.SO_SNDBUF,4096)
-        relay_upstream.setsockopt(socket.SOL_SOCKET,socket.SO_RCVBUF,4096)
-        client.setsockopt(socket.SOL_SOCKET,socket.SO_RCVBUF,4096)
-        server.settimeout(3)
-        finished=threading.Event()
-        def download():
-            try:
-                for _ in range(2048): server.sendall(b'x'*65536)
-            except OSError: pass
-            finally: finished.set()
-        forwarding=threading.Thread(target=m.forward_connection,args=(relay_client,relay_upstream),daemon=True)
-        sending=threading.Thread(target=download,daemon=True)
-        forwarding.start(); sending.start()
-        try:
-            self.assertFalse(finished.wait(.2),"Download should be backpressured")
-            client.sendall(b'keepalive')
-            self.assertEqual(m.recv_exact(server,9),b'keepalive')
-            self.assertFalse(finished.is_set())
-        finally:
-            for peer in (client,relay_client,relay_upstream,server):
-                try: peer.shutdown(socket.SHUT_RDWR)
-                except OSError: pass
-            forwarding.join(3); sending.join(3)
-            for peer in (client,relay_client,relay_upstream,server): peer.close()
-        self.assertFalse(forwarding.is_alive())
-        self.assertFalse(sending.is_alive())
-
-class RelayTests(unittest.TestCase):
+class FrpTests(unittest.TestCase):
+    def setUp(self):
+        self.config={"frp":{"configured":True},"repository":"owner/ops"}
+        self.guard=threading.Lock()
+        self.pending=[{"id":"r1","created":m.time.time()}]
     def test_dispatch_once_through_existing_action(self):
-        state={}; gh=Mock(); config={"relay":{},"repository":"owner/ops"}
-        config["relay"]={"configured":True}
-        with patch.object(m,"relay_api",return_value=[{"id":"r1","created":m.time.time()}]):
-            m.poll_relay(config,gh,state);m.poll_relay(config,gh,state)
+        state={};gh=Mock()
+        m.poll_frp_requests(self.config,gh,state,self.pending,self.guard)
+        m.poll_frp_requests(self.config,gh,state,self.pending,self.guard)
         gh.api.assert_called_once_with("repos/owner/ops/dispatches",method="POST",
-            data={"event_type":"start-minecraft","client_payload":{"relay_request":"r1"}})
-        self.assertEqual(state["relay_seen"],["r1"])
+            data={"event_type":"start-minecraft","client_payload":{"frp_request":"r1"}})
+        self.assertEqual(state["frp_seen"],["r1"])
     def test_failed_dispatch_remains_retryable(self):
         state={};gh=Mock();gh.api.side_effect=OSError("network")
-        with patch.object(m,"relay_api",return_value=[{"id":"r1","created":m.time.time()}]):
-            with self.assertRaises(OSError):m.poll_relay({"relay":{"configured":True},"repository":"owner/ops"},gh,state)
-        self.assertEqual(state["relay_seen"],[])
+        with self.assertRaises(OSError):m.poll_frp_requests(self.config,gh,state,self.pending,self.guard)
+        self.assertEqual(state["frp_seen"],[])
     def test_expired_and_future_requests_ignored(self):
-        gh=Mock()
-        with patch.object(m,"relay_api",return_value=[{"id":"old","created":m.time.time()-601},{"id":"future","created":m.time.time()+60}]):
-            m.poll_relay({"relay":{"configured":True}},gh,{})
-        gh.api.assert_not_called()
+        gh=Mock();self.pending=[{"id":"old","created":m.time.time()-601},{"id":"future","created":m.time.time()+60}]
+        m.poll_frp_requests(self.config,gh,{},self.pending,self.guard);gh.api.assert_not_called()
     def test_shutdown_wake_waits_without_consuming(self):
-        state={};gh=Mock()
-        with patch.object(m,"read_json",return_value={"phase":"backing_up"}), patch.object(m,"relay_api") as api:
-            m.poll_relay({"relay":{"configured":True},"state_prefix":"unused"},gh,state)
-        api.assert_not_called();gh.api.assert_not_called();self.assertEqual(state,{})
-    def test_pin_checked_before_sending_token(self):
-        conn=Mock();conn.sock.getpeercert.return_value=b"wrong certificate"
-        with patch.object(m.http.client,"HTTPSConnection",return_value=conn), patch.object(m.ssl,"create_default_context"):
-            with self.assertRaises(m.ssl.SSLError):
-                m.relay_api({"relay":{"host":"example.invalid","https_port":24443,"cert_sha256":"0"*64,"admin_token":"secret","ca_cert":"ca.pem"}},"/requests")
-        conn.request.assert_not_called();conn.close.assert_called_once()
+        state={};gh=Mock();self.config["state_prefix"]="unused"
+        with patch.object(m,"read_json",return_value={"phase":"backing_up"}):
+            m.poll_frp_requests(self.config,gh,state,self.pending,self.guard)
+        gh.api.assert_not_called();self.assertEqual(state,{})
+    def test_native_frpc_credentials_never_in_arguments(self):
+        c={"state_prefix":"C:/data/mc","frp":{"exe":"frpc.exe","tunnel_ids":[1,2]}}
+        with patch.object(m,"frp_token",return_value="private-token"),patch.object(m.subprocess,"Popen") as spawn:
+            m.open_frp(c,None)
+        args=spawn.call_args.args[0];kw=spawn.call_args.kwargs
+        self.assertNotIn("private-token"," ".join(args))
+        self.assertEqual(kw["env"]["NATFRP_TARGET"],"1,2")
+        self.assertEqual(kw["env"]["NATFRP_TOKEN"],"private-token")
+    def test_sakura_authorization_matches_exact_ip(self):
+        response=Mock();response.status=200;response.read.return_value=b'"192.0.2.9"'
+        cm=Mock();cm.__enter__=Mock(return_value=response);cm.__exit__=Mock(return_value=False)
+        with patch.object(m,"frp_token",return_value="host-only"),patch.object(m.urllib.request,"urlopen",return_value=cm) as call:
+            m.authorize_frp({"frp":{"game_tunnel_id":42}},"192.0.2.9")
+            self.assertEqual(json.loads(call.call_args.args[0].data),{"id":42,"ip":"192.0.2.9"})
+            response.read.return_value=b'"192.0.2.10"'
+            with self.assertRaises(ConnectionError):m.authorize_frp({"frp":{"game_tunnel_id":42}},"192.0.2.9")
+
+class ProxyHeaderTests(unittest.TestCase):
+    def parse(self,header):
+        a,b=socket.socketpair()
+        try:
+            a.sendall(header);a.shutdown(socket.SHUT_WR);return m.proxy_source(b)
+        finally:a.close();b.close()
+    def header(self,family,data):return b"\r\n\r\n\0\r\nQUIT\n"+bytes([0x21,family])+struct.pack(">H",len(data))+data
+    def test_ipv4(self):
+        h=self.header(0x11,socket.inet_aton("192.0.2.9")+socket.inet_aton("127.0.0.1")+struct.pack(">HH",1234,443))
+        self.assertEqual(self.parse(h),("192.0.2.9",1234))
+    def test_ipv6(self):
+        h=self.header(0x21,socket.inet_pton(socket.AF_INET6,"2001:db8::1")+socket.inet_pton(socket.AF_INET6,"::1")+struct.pack(">HH",1234,443))
+        self.assertEqual(self.parse(h),("2001:db8::1",1234))
+    def test_untrusted_header_rejected(self):
+        for h in [b"X"*16,self.header(0x12,b"x"*12),self.header(0x11,b"x"*11),self.header(0x11,b"x"*513)]:
+            with self.subTest(h=h[:16]):
+                with self.assertRaises(ValueError):self.parse(h)
+    def test_truncated_header_rejected(self):
+        with self.assertRaises(ConnectionError):self.parse(b"\r\n")
+
+class WakeApiTests(unittest.TestCase):
+    def setUp(self):
+        self.pending=[];self.guard=threading.Lock();self.c={"port":25565,"frp":{"api_port":0,"client_token":"friend-only","cert":"cert","key":"key"}}
+        tls=Mock();tls.wrap_socket.side_effect=lambda conn,**kwargs:conn
+        with patch.object(m.ssl,"SSLContext",return_value=tls):self.server=m.make_frp_api(self.c,self.pending,self.guard)
+        self.thread=threading.Thread(target=self.server.serve_forever,daemon=True);self.thread.start()
+    def tearDown(self):self.server.shutdown();self.server.server_close();self.thread.join(2)
+    def request(self,method,path,token="friend-only"):
+        with socket.create_connection(self.server.server_address,2) as conn:
+            addr=socket.inet_aton("192.0.2.9")+socket.inet_aton("127.0.0.1")+struct.pack(">HH",1234,443)
+            conn.sendall(b"\r\n\r\n\0\r\nQUIT\n"+bytes([0x21,0x11])+struct.pack(">H",len(addr))+addr)
+            conn.sendall((f"{method} {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nX-Real-IP: 192.0.2.99\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").encode())
+            import http.client
+            r=http.client.HTTPResponse(conn);r.begin();return r.status
+    def test_unauthorized_cannot_wake(self):
+        with patch.object(m,"authorize_frp") as auth:
+            self.assertEqual(self.request("POST","/wake","wrong"),401);auth.assert_not_called()
+        self.assertEqual(self.pending,[])
+    def test_verified_source_not_header_controls_admission(self):
+        with patch.object(m,"authorize_frp") as auth:
+            self.assertEqual(self.request("POST","/wake"),204)
+            auth.assert_called_once_with(self.c,"192.0.2.9")
+        self.assertEqual(len(self.pending),1)
+    def test_failed_admission_cannot_enqueue(self):
+        with patch.object(m,"authorize_frp",side_effect=OSError("offline")):
+            self.assertEqual(self.request("POST","/wake"),503)
+        self.assertEqual(self.pending,[])
+    def test_readiness_is_real_protocol(self):
+        with patch.object(m,"status",side_effect=OSError("stopped")):
+            self.assertEqual(self.request("GET","/ready"),503)
+        with patch.object(m,"status",return_value={"players":{"online":0}}):
+            self.assertEqual(self.request("GET","/ready"),204)
 
 if __name__=="__main__":unittest.main()

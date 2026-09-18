@@ -3,7 +3,7 @@ Only stdlib + the user's existing gh login are needed. Runtime files stay outsid
 """
 import argparse, contextlib, ctypes, hashlib, json, logging, os, re, socket, struct
 import subprocess, sys, threading, time, urllib.request, zipfile
-import hmac, http.client, http.server, ipaddress, select, socketserver, ssl
+import hmac, http.server, ipaddress, ssl
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -170,138 +170,102 @@ def poll_wake_runs(gh,c):
             errors[workflow]=type(exc).__name__
     return sorted(runs.values(),key=lambda r:r.get("created_at","")),errors
 
-def relay_api(c, path):
-    """Authenticate the pinned relay before sending its host-only polling token."""
-    r=c["relay"]
-    conn=http.client.HTTPSConnection(r["host"],r["https_port"],timeout=10,
-        context=ssl.create_default_context(cafile=r["ca_cert"]))
-    try:
-        conn.connect()
-        fingerprint=hashlib.sha256(conn.sock.getpeercert(binary_form=True)).hexdigest()
-        if not hmac.compare_digest(fingerprint,r["cert_sha256"]):
-            raise ssl.SSLError("Relay certificate pin mismatch")
-        conn.request("GET",path,headers={"Authorization":"Bearer "+r["admin_token"]})
-        response=conn.getresponse()
-        if response.status != 200: raise ConnectionError("Relay request rejected")
-        return json.loads(response.read(65536))
-    finally:
-        conn.close()
+def frp_token(c):
+    return read_json(Path(c["frp"]["token_file"]))["token"]
 
-def poll_relay(c, gh, state):
-    if not c.get("relay"): return
-    # Do not consume a new wake while the previous session is saving/backing up.
+def authorize_frp(c, source):
+    body=json.dumps({"id":c["frp"]["game_tunnel_id"],"ip":str(ipaddress.ip_address(source))}).encode()
+    req=urllib.request.Request("https://api.natfrp.com/v4/tunnel/auth",data=body,
+        headers={"Authorization":"Bearer "+frp_token(c),"User-Agent":"MinecraftController/1.0",
+                 "Content-Type":"application/json"})
+    with urllib.request.urlopen(req,timeout=10) as response:
+        if response.status != 200: raise ConnectionError("FRP authorization rejected")
+        granted=json.loads(response.read(4096))
+    if granted != source: raise ConnectionError("FRP authorization address mismatch")
+
+def poll_frp_requests(c, gh, state, requests, guard):
+    if not c.get("frp"): return
     if c.get("state_prefix") and read_json(runtime_paths(c)["runtime"],{}).get("phase") in ("stopping","backing_up"):
         return
-    seen=state.setdefault("relay_seen",[])
-    for request in relay_api(c,"/requests"):
+    seen=state.setdefault("frp_seen",[])
+    with guard: pending=list(requests)
+    for request in pending:
         rid=request["id"]
         if rid in seen or not 0 <= time.time()-request["created"] <= 600: continue
         gh.api(f"repos/{c['repository']}/dispatches",method="POST",
-            data={"event_type":"start-minecraft","client_payload":{"relay_request":rid}})
-        seen.append(rid)
-        del seen[:-128]
-        LOG.info("Relay wake %s dispatched through GitHub Actions",rid)
+            data={"event_type":"start-minecraft","client_payload":{"frp_request":rid}})
+        seen.append(rid); del seen[:-128]
+        LOG.info("FRP wake %s dispatched through GitHub Actions",rid)
 
-def open_tunnel(c, output):
-    r=c["relay"]
-    return subprocess.Popen([r["ssh"],"-N","-T","-i",r["key"],
-        "-o","IdentitiesOnly=yes","-o","BatchMode=yes","-o","StrictHostKeyChecking=yes",
-        "-o","ExitOnForwardFailure=yes","-o","ConnectTimeout=10",
-        "-o","ServerAliveInterval=30","-o","ServerAliveCountMax=3",
-        "-R",f"127.0.0.1:{r['backend_port']}:127.0.0.1:{c['port']}",
-        "root@"+r["host"]],stdin=subprocess.DEVNULL,stdout=output,stderr=output,
-        creationflags=HIDDEN,close_fds=True)
+def open_frp(c, output):
+    r=c["frp"];env=os.environ.copy()
+    env.update(NATFRP_TOKEN=frp_token(c),NATFRP_TARGET=",".join(str(x) for x in r["tunnel_ids"]))
+    return subprocess.Popen([r["exe"],"--no_check_update","--disable_log_color","--proxy","none",
+        "--watch",str(os.getpid())],cwd=str(Path(c["state_prefix"]).parent),env=env,
+        stdin=subprocess.DEVNULL,stdout=output,stderr=output,creationflags=HIDDEN,close_fds=True)
 
-def forward_connection(client, upstream):
-    """Keep keepalives flowing upstream while a slow client downloads models/chunks."""
-    for peer in (client, upstream): peer.settimeout(120)
-    def copy(source, destination):
-        try:
-            while True:
-                data=source.recv(65536)
-                if not data: break
-                destination.sendall(data)
-        except OSError as exc:
-            LOG.info("Relay stream closed (%s)",type(exc).__name__)
-        finally:
-            for peer in (client, upstream):
-                try: peer.shutdown(socket.SHUT_RDWR)
-                except OSError: pass
-    download=threading.Thread(target=copy,args=(upstream,client),daemon=True)
-    download.start()
-    try: copy(client,upstream)
-    finally: download.join(2)
+def proxy_source(conn):
+    """Accept only the strict TCP PROXY-v2 preface inserted by our loopback frpc."""
+    header=recv_exact(conn,16)
+    if header[:12] != b"\r\n\r\n\x00\r\nQUIT\n" or header[12] != 0x21:
+        raise ValueError("Expected PROXY v2")
+    length=struct.unpack(">H",header[14:16])[0]
+    family=header[13]
+    minimum={0x11:12,0x21:36}.get(family)
+    if minimum is None or not minimum <= length <= 512: raise ValueError("Invalid PROXY address")
+    data=recv_exact(conn,length)
+    if family==0x11: return str(ipaddress.ip_address(data[:4])),struct.unpack(">H",data[8:10])[0]
+    return str(ipaddress.ip_address(data[:16])),struct.unpack(">H",data[32:34])[0]
 
-def serve_relay(c):
-    """Private friend ingress: pinned HTTPS capability -> source-IP lease -> SSH loopback.
-    No GitHub credential, game data or executable commands are accepted by the relay.
-    Leases and pending signals deliberately expire on a service restart (fail closed).
-    """
-    allowed={}; pending=[]; guard=threading.Lock(); slots=threading.BoundedSemaphore(32)
+def make_frp_api(c, requests, guard):
+    """Only the HTTPS wake API is Python; Minecraft traffic is forwarded by native frpc."""
+    r=c["frp"]
+    tls=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    tls.minimum_version=ssl.TLSVersion.TLSv1_2
+    tls.load_cert_chain(r["cert"],r["key"])
     class API(http.server.BaseHTTPRequestHandler):
-        def log_message(self, *args): pass  # Never log capability headers.
-        def reply(self, code, data=None):
-            body=b"" if data is None else json.dumps(data).encode()
-            self.send_response(code); self.send_header("Content-Type","application/json")
-            self.send_header("Content-Length",str(len(body))); self.end_headers()
-            self.wfile.write(body)
-        def authorized(self, admin=False):
-            token=c["admin_token"] if admin else c["client_token"]
-            return hmac.compare_digest(self.headers.get("Authorization","").encode(),("Bearer "+token).encode())
+        def log_message(self,*args): pass
+        def reply(self,code):
+            self.send_response(code);self.send_header("Content-Length","0");self.end_headers()
+        def authorized(self):
+            return hmac.compare_digest(self.headers.get("Authorization","").encode(),("Bearer "+r["client_token"]).encode())
         def do_GET(self):
-            if self.path == "/requests":
-                if not self.authorized(admin=True): return self.reply(401)
-                with guard: requests=[x for x in pending if 0 <= time.time()-x["created"] <= 600]
-                return self.reply(200,requests)
             if self.path != "/ready": return self.reply(404)
             if not self.authorized(): return self.reply(401)
-            try: status(port=c["backend_port"])
+            try: status(port=c["port"])
             except (OSError,ValueError): return self.reply(503)
             return self.reply(204)
         def do_POST(self):
             if self.path != "/wake": return self.reply(404)
             if not self.authorized(): return self.reply(401)
-            try: source=str(ipaddress.ip_address(self.headers.get("X-Real-IP","")))
-            except ValueError: return self.reply(400)
-            # API binds only to loopback; nginx overwrites this header with the real peer.
+            try: authorize_frp(c,self.client_address[0])
+            except Exception as exc:
+                LOG.warning("FRP admission failed (%s)",type(exc).__name__)
+                return self.reply(503)
             now=time.time()
             with guard:
-                for ip in list(allowed):
-                    if allowed[ip] <= now: del allowed[ip]
-                if source not in allowed and len(allowed) >= 64: return self.reply(429)
-                allowed[source]=now+8*3600
-                if not pending or now-pending[-1]["created"] >= 60:
-                    pending.append({"id":str(int(now*1_000_000_000)),"created":now})
-                    del pending[:-128]
+                if not requests or now-requests[-1]["created"] >= 60:
+                    requests.append({"id":str(time.time_ns()),"created":now}); del requests[:-64]
             return self.reply(204)
-    class Proxy(socketserver.BaseRequestHandler):
-        def handle(self):
-            with guard: permit=allowed.get(self.client_address[0],0)>time.time()
-            if not permit: return
+    class HTTPS(http.server.ThreadingHTTPServer):
+        daemon_threads=True
+        def get_request(self):
+            conn,peer=self.socket.accept();conn.settimeout(10)
             try:
-                with socket.create_connection(("127.0.0.1",c["backend_port"]),timeout=10) as upstream:
-                    forward_connection(self.request,upstream)
-            except (OSError,ValueError): pass
-    class TCP(socketserver.ThreadingTCPServer):
-        allow_reuse_address=True; daemon_threads=True
-        def process_request(self, request, address):
-            if not slots.acquire(blocking=False): return self.shutdown_request(request)
-            try: super().process_request(request,address)
-            except Exception:
-                slots.release(); raise
-        def process_request_thread(self, request, address):
-            try: super().process_request_thread(request,address)
-            finally: slots.release()
-    with TCP(("0.0.0.0",c["public_port"]),Proxy) as tcp:
-        threading.Thread(target=tcp.serve_forever,daemon=True).start()
-        class HTTP(socketserver.ThreadingMixIn,http.server.HTTPServer):
-            daemon_threads=True
-        with HTTP(("127.0.0.1",c["api_port"]),API) as api:
-            api.serve_forever()
+                if not ipaddress.ip_address(peer[0]).is_loopback: raise ValueError("Non-local frpc")
+                source=proxy_source(conn)
+                return tls.wrap_socket(conn,server_side=True),source
+            except (OSError,ValueError):
+                conn.close(); raise OSError("Invalid FRP HTTPS connection") from None
+    return HTTPS(("127.0.0.1",r["api_port"]),API)
 
 def listen(c, config_file):
     paths=runtime_paths(c); gh=GitHub(c["gh"])
+    pending=[]; pending_guard=threading.Lock()
     with lock(paths["listener_lock"]):
+        if c.get("frp"):
+            api=make_frp_api(c,pending,pending_guard)
+            threading.Thread(target=api.serve_forever,daemon=True).start()
         state=read_json(paths["listener"],None)
         if state is None:
             state={"activated_utc":utcnow().isoformat(),"seen":[],"requests":[]}
@@ -312,10 +276,10 @@ def listen(c, config_file):
         while True:
             try:
                 try:
-                    poll_relay(c,gh,state)
-                    state.pop("relay_error",None)
+                    poll_frp_requests(c,gh,state,pending,pending_guard)
+                    state.pop("frp_error",None)
                 except Exception as exc:
-                    state["relay_error"]=type(exc).__name__
+                    state["frp_error"]=type(exc).__name__
                 atomic(paths["listener"],state)
                 runs,errors=poll_wake_runs(gh,c)
                 for run in runs:
@@ -357,7 +321,7 @@ def supervise(c,config_file):
         # Fail closed rather than fight an orphaned polling process from an earlier supervisor.
         if pid_alive(previous.get("child_pid")):
             raise RuntimeError("Prior listener is still alive; inspect before taking ownership")
-        if c.get("relay") and pid_alive(previous.get("tunnel_pid")):
+        if c.get("frp") and pid_alive(previous.get("frpc_pid")):
             raise RuntimeError("Prior owned tunnel is still alive; inspect before replacement")
         state={"pid":os.getpid(),"started_utc":utcnow().isoformat(),"restart_count":0,"child_pid":None}
         tunnel=None; last_tunnel_attempt=0
@@ -370,11 +334,11 @@ def supervise(c,config_file):
                 state.update(child_pid=child.pid,phase="running",child_started_utc=utcnow().isoformat())
                 LOG.info("Supervisor started listener pid=%s",child.pid)
                 while child.poll() is None:
-                    if c.get("relay") and (tunnel is None or tunnel.poll() is not None) and time.monotonic()-last_tunnel_attempt >= 30:
+                    if c.get("frp") and (tunnel is None or tunnel.poll() is not None) and time.monotonic()-last_tunnel_attempt >= 30:
                         last_tunnel_attempt=time.monotonic()
                         with paths["diagnostic_log"].open("a",encoding="utf-8") as out:
-                            tunnel=open_tunnel(c,out)
-                        state["tunnel_pid"]=tunnel.pid
+                            tunnel=open_frp(c,out)
+                        state["frpc_pid"]=tunnel.pid
                     state["heartbeat_utc"]=utcnow().isoformat();atomic(paths["supervisor"],state)
                     try: observed=read_json(paths["listener"],{})
                     except (OSError,ValueError): observed={}
@@ -502,11 +466,10 @@ def worker(c,request_id):
             atomic(paths["runtime"],state)
 
 def main():
-    a=argparse.ArgumentParser(); a.add_argument("mode",choices=["listen","supervise","worker","request","status","stop","relay"])
+    a=argparse.ArgumentParser(); a.add_argument("mode",choices=["listen","supervise","worker","request","status","stop"])
     a.add_argument("--config",required=True);a.add_argument("--request-id",default="manual")
     a.add_argument("--event",choices=["start-server","start-minecraft"],default="start-minecraft")
     args=a.parse_args();config_file=Path(args.config).resolve();c=read_json(config_file)
-    if args.mode=="relay": return serve_relay(c)
     paths=runtime_paths(c)
     logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(message)s",
         handlers=[logging.FileHandler(paths["log"],encoding="utf-8")])
