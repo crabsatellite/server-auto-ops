@@ -3,6 +3,7 @@ Only stdlib + the user's existing gh login are needed. Runtime files stay outsid
 """
 import argparse, contextlib, ctypes, hashlib, json, logging, os, re, socket, struct
 import subprocess, sys, threading, time, urllib.request, zipfile
+import hmac, http.client, http.server, ipaddress, select, socketserver, ssl
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -169,6 +170,135 @@ def poll_wake_runs(gh,c):
             errors[workflow]=type(exc).__name__
     return sorted(runs.values(),key=lambda r:r.get("created_at","")),errors
 
+def relay_api(c, path):
+    """Authenticate the pinned relay before sending its host-only polling token."""
+    r=c["relay"]
+    conn=http.client.HTTPSConnection(r["host"],r["https_port"],timeout=10,
+        context=ssl.create_default_context(cafile=r["ca_cert"]))
+    try:
+        conn.connect()
+        fingerprint=hashlib.sha256(conn.sock.getpeercert(binary_form=True)).hexdigest()
+        if not hmac.compare_digest(fingerprint,r["cert_sha256"]):
+            raise ssl.SSLError("Relay certificate pin mismatch")
+        conn.request("GET",path,headers={"Authorization":"Bearer "+r["admin_token"]})
+        response=conn.getresponse()
+        if response.status != 200: raise ConnectionError("Relay request rejected")
+        return json.loads(response.read(65536))
+    finally:
+        conn.close()
+
+def poll_relay(c, gh, state):
+    if not c.get("relay"): return
+    # Do not consume a new wake while the previous session is saving/backing up.
+    if c.get("state_prefix") and read_json(runtime_paths(c)["runtime"],{}).get("phase") in ("stopping","backing_up"):
+        return
+    seen=state.setdefault("relay_seen",[])
+    for request in relay_api(c,"/requests"):
+        rid=request["id"]
+        if rid in seen or not 0 <= time.time()-request["created"] <= 600: continue
+        gh.api(f"repos/{c['repository']}/dispatches",method="POST",
+            data={"event_type":"start-minecraft","client_payload":{"relay_request":rid}})
+        seen.append(rid)
+        del seen[:-128]
+        LOG.info("Relay wake %s dispatched through GitHub Actions",rid)
+
+def open_tunnel(c, output):
+    r=c["relay"]
+    return subprocess.Popen([r["ssh"],"-N","-T","-i",r["key"],
+        "-o","IdentitiesOnly=yes","-o","BatchMode=yes","-o","StrictHostKeyChecking=yes",
+        "-o","ExitOnForwardFailure=yes","-o","ConnectTimeout=10",
+        "-o","ServerAliveInterval=30","-o","ServerAliveCountMax=3",
+        "-R",f"127.0.0.1:{r['backend_port']}:127.0.0.1:{c['port']}",
+        "root@"+r["host"]],stdin=subprocess.DEVNULL,stdout=output,stderr=output,
+        creationflags=HIDDEN,close_fds=True)
+
+def forward_connection(client, upstream):
+    """Keep keepalives flowing upstream while a slow client downloads models/chunks."""
+    for peer in (client, upstream): peer.settimeout(120)
+    def copy(source, destination):
+        try:
+            while True:
+                data=source.recv(65536)
+                if not data: break
+                destination.sendall(data)
+        except OSError as exc:
+            LOG.info("Relay stream closed (%s)",type(exc).__name__)
+        finally:
+            for peer in (client, upstream):
+                try: peer.shutdown(socket.SHUT_RDWR)
+                except OSError: pass
+    download=threading.Thread(target=copy,args=(upstream,client),daemon=True)
+    download.start()
+    try: copy(client,upstream)
+    finally: download.join(2)
+
+def serve_relay(c):
+    """Private friend ingress: pinned HTTPS capability -> source-IP lease -> SSH loopback.
+    No GitHub credential, game data or executable commands are accepted by the relay.
+    Leases and pending signals deliberately expire on a service restart (fail closed).
+    """
+    allowed={}; pending=[]; guard=threading.Lock(); slots=threading.BoundedSemaphore(32)
+    class API(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args): pass  # Never log capability headers.
+        def reply(self, code, data=None):
+            body=b"" if data is None else json.dumps(data).encode()
+            self.send_response(code); self.send_header("Content-Type","application/json")
+            self.send_header("Content-Length",str(len(body))); self.end_headers()
+            self.wfile.write(body)
+        def authorized(self, admin=False):
+            token=c["admin_token"] if admin else c["client_token"]
+            return hmac.compare_digest(self.headers.get("Authorization","").encode(),("Bearer "+token).encode())
+        def do_GET(self):
+            if self.path == "/requests":
+                if not self.authorized(admin=True): return self.reply(401)
+                with guard: requests=[x for x in pending if 0 <= time.time()-x["created"] <= 600]
+                return self.reply(200,requests)
+            if self.path != "/ready": return self.reply(404)
+            if not self.authorized(): return self.reply(401)
+            try: status(port=c["backend_port"])
+            except (OSError,ValueError): return self.reply(503)
+            return self.reply(204)
+        def do_POST(self):
+            if self.path != "/wake": return self.reply(404)
+            if not self.authorized(): return self.reply(401)
+            try: source=str(ipaddress.ip_address(self.headers.get("X-Real-IP","")))
+            except ValueError: return self.reply(400)
+            # API binds only to loopback; nginx overwrites this header with the real peer.
+            now=time.time()
+            with guard:
+                for ip in list(allowed):
+                    if allowed[ip] <= now: del allowed[ip]
+                if source not in allowed and len(allowed) >= 64: return self.reply(429)
+                allowed[source]=now+8*3600
+                if not pending or now-pending[-1]["created"] >= 60:
+                    pending.append({"id":str(int(now*1_000_000_000)),"created":now})
+                    del pending[:-128]
+            return self.reply(204)
+    class Proxy(socketserver.BaseRequestHandler):
+        def handle(self):
+            with guard: permit=allowed.get(self.client_address[0],0)>time.time()
+            if not permit: return
+            try:
+                with socket.create_connection(("127.0.0.1",c["backend_port"]),timeout=10) as upstream:
+                    forward_connection(self.request,upstream)
+            except (OSError,ValueError): pass
+    class TCP(socketserver.ThreadingTCPServer):
+        allow_reuse_address=True; daemon_threads=True
+        def process_request(self, request, address):
+            if not slots.acquire(blocking=False): return self.shutdown_request(request)
+            try: super().process_request(request,address)
+            except Exception:
+                slots.release(); raise
+        def process_request_thread(self, request, address):
+            try: super().process_request_thread(request,address)
+            finally: slots.release()
+    with TCP(("0.0.0.0",c["public_port"]),Proxy) as tcp:
+        threading.Thread(target=tcp.serve_forever,daemon=True).start()
+        class HTTP(socketserver.ThreadingMixIn,http.server.HTTPServer):
+            daemon_threads=True
+        with HTTP(("127.0.0.1",c["api_port"]),API) as api:
+            api.serve_forever()
+
 def listen(c, config_file):
     paths=runtime_paths(c); gh=GitHub(c["gh"])
     with lock(paths["listener_lock"]):
@@ -181,6 +311,12 @@ def listen(c, config_file):
         LOG.info("Listener active pid=%s; trusted workflows=%s",os.getpid(),wake_workflows(c))
         while True:
             try:
+                try:
+                    poll_relay(c,gh,state)
+                    state.pop("relay_error",None)
+                except Exception as exc:
+                    state["relay_error"]=type(exc).__name__
+                atomic(paths["listener"],state)
                 runs,errors=poll_wake_runs(gh,c)
                 for run in runs:
                     if not eligible(run,c,activated,state["seen"]): continue
@@ -221,7 +357,10 @@ def supervise(c,config_file):
         # Fail closed rather than fight an orphaned polling process from an earlier supervisor.
         if pid_alive(previous.get("child_pid")):
             raise RuntimeError("Prior listener is still alive; inspect before taking ownership")
+        if c.get("relay") and pid_alive(previous.get("tunnel_pid")):
+            raise RuntimeError("Prior owned tunnel is still alive; inspect before replacement")
         state={"pid":os.getpid(),"started_utc":utcnow().isoformat(),"restart_count":0,"child_pid":None}
+        tunnel=None; last_tunnel_attempt=0
         while True:
             child=None; started=time.time()
             try:
@@ -231,6 +370,11 @@ def supervise(c,config_file):
                 state.update(child_pid=child.pid,phase="running",child_started_utc=utcnow().isoformat())
                 LOG.info("Supervisor started listener pid=%s",child.pid)
                 while child.poll() is None:
+                    if c.get("relay") and (tunnel is None or tunnel.poll() is not None) and time.monotonic()-last_tunnel_attempt >= 30:
+                        last_tunnel_attempt=time.monotonic()
+                        with paths["diagnostic_log"].open("a",encoding="utf-8") as out:
+                            tunnel=open_tunnel(c,out)
+                        state["tunnel_pid"]=tunnel.pid
                     state["heartbeat_utc"]=utcnow().isoformat();atomic(paths["supervisor"],state)
                     try: observed=read_json(paths["listener"],{})
                     except (OSError,ValueError): observed={}
@@ -358,10 +502,11 @@ def worker(c,request_id):
             atomic(paths["runtime"],state)
 
 def main():
-    a=argparse.ArgumentParser(); a.add_argument("mode",choices=["listen","supervise","worker","request","status","stop"])
+    a=argparse.ArgumentParser(); a.add_argument("mode",choices=["listen","supervise","worker","request","status","stop","relay"])
     a.add_argument("--config",required=True);a.add_argument("--request-id",default="manual")
     a.add_argument("--event",choices=["start-server","start-minecraft"],default="start-minecraft")
     args=a.parse_args();config_file=Path(args.config).resolve();c=read_json(config_file)
+    if args.mode=="relay": return serve_relay(c)
     paths=runtime_paths(c)
     logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(message)s",
         handlers=[logging.FileHandler(paths["log"],encoding="utf-8")])

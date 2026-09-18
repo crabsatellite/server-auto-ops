@@ -20,7 +20,9 @@ Minecraft-only. Both `start-server` (legacy callers) and `start-minecraft` now s
 - After shutdown, ignored authoritative files are archived and hash-verified, then tracked state is committed/pushed with remote SHA verification. Initial full archive + Git bundles are the migration rollback copy; don't delete them. Session archives have no automatic retention deletion.
 - Process locks prevent duplicate workers. A live orphan process blocks new startup and requires inspection. No arbitrary remote commands or downloaded scripts are executed.
 - Keep the Minecraft listener bound to loopback until ingress/authentication is deliberately configured. Offline-mode without authentication is not safe for unguarded public forwarding. Do not change online-mode blindly: player UUID/inventory mapping can change.
-- SDGO, cloud lifecycle, billing, public relay setup and cloud-exclusive final data recovery are outside this controller.
+- Optional friend ingress uses `relay` mode on Wulanchabu: scoped-CA HTTPS wake grants the requesting IP an eight-hour TCP lease; an SSH reverse tunnel connects only to the local Minecraft port. The host polls with a separate admin capability and dispatches the existing GitHub wake action. Keep capabilities, SSH private keys and host config outside Git; only the limited friend capability and public CA belong in the private client pack. Downloads and keepalive traffic are forwarded independently.
+- The private client pack must publish its existing `start_server.bat`, relay CA and PCL `VersionAdvanceRun`/`VersionAdvanceRunWait` settings together, then verify the CodeUp mirror. Native `VersionServerEnter` selects Wulanchabu for friends; the physical host update override selects loopback. Updating files alone does not refresh a running PCL process or rewrite personal multiplayer favorites.
+- SDGO, cloud lifecycle, billing and cloud-exclusive final data recovery remain outside this controller.
 
 ## Tests
 
